@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "getqzonehistory"
+version = "2.0.0"
+description = "QQ空间历史说说获取工具 - Get QQ Zone historical posts"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "LibraHp"},
+    {name = "Enge1337", email = "contributor"}
+]
+keywords = ["qq", "qzone", "scraper", "history", "social-media"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Natural Language :: Chinese (Simplified)",
+]
+
+dependencies = [
+    "beautifulsoup4>=4.12.3",
+    "pandas>=2.2.3",
+    "tqdm>=4.67.0",
+    "requests>=2.32.3",
+    "Pillow>=11.0.0",
+    "pyarrow>=18.0.0",
+    "openpyxl>=3.1.5",
+    "pyzbar>=0.1.9",
+    "qrcode>=7.4.2",
+    "fake-useragent>=1.5.1",
+    "chardet>=5.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+qzone-history = "main:run_main"
+qzone-gui = "gui_app:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

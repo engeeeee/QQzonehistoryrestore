@@ -1,0 +1,516 @@
+import shutil
+from datetime import datetime
+import subprocess
+import logging
+from bs4 import BeautifulSoup
+import util.RequestUtil as Request
+import util.ToolsUtil as Tools
+import util.ConfigUtil as Config
+import util.GetAllMomentsUtil as GetAllMoments
+import pandas as pd
+import signal
+import os
+import re
+from tqdm import trange, tqdm
+import requests
+import time
+import platform
+import chardet
+import sys
+import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+# 配置日志
+logger = logging.getLogger(__name__)
+
+if os.environ.get("QZONE_GUI") != "1":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+texts = list()
+all_friends = list()
+other_message = list()
+user_message = list()
+leave_message = list()
+forward_message = list()
+
+# 线程安全锁
+texts_lock = threading.Lock()
+friends_lock = threading.Lock()
+
+
+def normalize_texts(records):
+    normalized = []
+    if not records:
+        return normalized
+    for item in records:
+        if item is None:
+            continue
+        if not isinstance(item, list):
+            try:
+                item = list(item)
+            except Exception:
+                continue
+        if len(item) < 4:
+            item = item + [""] * (4 - len(item))
+        elif len(item) > 4:
+            item = item[:4]
+        normalized.append(item)
+    return normalized
+
+
+# 并发处理单个批次的消息
+def process_batch_messages(batch_data):
+    """处理单个批次的消息数据"""
+    batch_texts = []
+    batch_friends = []
+    
+    try:
+        i, content_bytes = batch_data
+        
+        # 尝试多种编码方式解码
+        message = None
+        encodings_to_try = ['utf-8', 'gbk', 'gb2312', 'gb18030', 'big5']
+        
+        # 首先尝试chardet检测
+        try:
+            detected_encoding = chardet.detect(content_bytes)['encoding']
+            if detected_encoding:
+                encodings_to_try.insert(0, detected_encoding)
+        except:
+            pass
+        
+        # 尝试各种编码
+        for encoding in encodings_to_try:
+            try:
+                message = content_bytes.decode(encoding)
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        
+        # 如果所有编码都失败，使用错误处理策略
+        if message is None:
+            try:
+                message = content_bytes.decode('utf-8', errors='replace')
+            except:
+                return batch_texts, batch_friends
+
+        # 处理HTML数据
+        html = Tools.process_old_html(message)
+        # 使用更可靠的检测方法：检查多个特征标签
+        has_data = ('<li' in html or 'class="f-single' in html or 
+                   'f-s-s' in html or 'txt-box-title' in html)
+        if not has_data:
+            return batch_texts, batch_friends
+            
+        soup = BeautifulSoup(html, 'html.parser')
+
+        for element in soup.find_all('li', class_='f-single f-s-s'):
+            put_time = None
+            text = None
+            img = None
+            friend_element = element.find('a', class_='f-name q_namecard')
+            
+            # 获取好友昵称和QQ
+            if friend_element is not None:
+                friend_name = friend_element.get_text()
+                friend_qq = friend_element.get('link')[9:]
+                friend_link = friend_element.get('href')
+                batch_friends.append([friend_name, friend_qq, friend_link])
+
+            time_element = element.find('div', class_='info-detail')
+            text_element = element.find('p', class_='txt-box-title ellipsis-one')
+            img_element = element.find('a', class_='img-item')
+            
+            if time_element is not None and text_element is not None:
+                put_time = time_element.get_text().replace('\xa0', ' ')
+                text = text_element.get_text().replace('\xa0', ' ')
+                if img_element is not None:
+                    img = img_element.find('img').get('src')
+                batch_texts.append([put_time, text, img])
+                
+    except Exception as e:
+        print(f"处理批次 {batch_data[0]} 时发生异常: {e}")
+    
+    return batch_texts, batch_friends
+
+# 信号处理函数
+def signal_handler(signal, frame):
+    # 在手动结束程序时保存已有的数据
+    if len(texts) > 0:
+        save_data()
+    exit(0)
+
+
+def safe_strptime(date_str):
+    # 部分日期缺少最后的秒数，首先解析带秒数的日期格式，如果解析失败再解析不带秒数的日期
+    try:
+        # 尝试按照带秒格式解析日期
+        return datetime.strptime(date_str, "%Y年%m月%d日 %H:%M:%S")
+    except ValueError:
+        # 尝试按照不带秒格式解析日期
+        try:
+            return datetime.strptime(date_str, "%Y年%m月%d日 %H:%M")
+        except ValueError:
+            # 如果日期格式不对，返回 datetime.max
+            return datetime.max
+
+
+# 还原QQ空间网页版说说
+def render_html(shuoshuo_path, zhuanfa_path):
+    # 读取 Excel 文件内容
+    shuoshuo_df = pd.read_excel(shuoshuo_path)
+    zhuanfa_df = pd.read_excel(zhuanfa_path)
+    # 头像
+    avatar_url = f"https://q.qlogo.cn/headimg_dl?dst_uin={Request.uin}&spec=640&img_type=jpg"
+    # 提取说说列表中的数据
+    shuoshuo_data = shuoshuo_df[['时间', '内容', '图片链接', '评论']].values.tolist()
+    # 提取转发列表中的数据
+    zhuanfa_data = zhuanfa_df[['时间', '内容', '图片链接', '评论']].values.tolist()
+    # 合并所有数据
+    all_data = shuoshuo_data + zhuanfa_data
+    # 按时间排序
+    all_data.sort(key=lambda x: safe_strptime(x[0]) or datetime.min, reverse=True)
+    html_template, post_template, comment_template = Tools.get_html_template()
+    # 构建动态内容
+    post_html = ""
+    for entry in all_data:
+        try:
+            time, content, img_urls, comments = entry
+            img_url_lst = str(img_urls).split(",")
+            content_lst = content.split("：")
+            if len(content_lst) == 1:
+                continue
+            nickname = content_lst[0]
+            # 将nickname当中的QQ表情替换为img标签
+            nickname = re.sub(r'\[em\](.*?)\[/em\]', Tools.replace_em_to_img, nickname)
+            message = content_lst[1]
+            # 将message当中的QQ表情替换为img标签
+            message = re.sub(r'\[em\](.*?)\[/em\]', Tools.replace_em_to_img, message)
+            image_html = '<div class="image">'
+            for img_url in img_url_lst:
+                if img_url and img_url.startswith('http'):
+                    # 将图片替换为高清图
+                    img_url = str(img_url).replace("/m&ek=1&kp=1", "/s&ek=1&kp=1")
+                    img_url = str(img_url).replace(r"!/m/", "!/s/")
+                    image_html += f'<img src="{img_url}" alt="图片">\n'
+            image_html += "</div>"
+            comment_html = ""
+            # 获取评论数据
+            if str(comments) != "nan":
+                comments = eval(comments)
+                for comment in comments:
+                    comment_create_time, comment_content, comment_nickname, comment_uin = comment
+                    # 将评论人昵称和评论内容当中的QQ表情替换为img标签
+                    comment_nickname = re.sub(r'\[em\](.*?)\[/em\]', Tools.replace_em_to_img, comment_nickname)
+                    comment_content = re.sub(r'\[em\](.*?)\[/em\]', Tools.replace_em_to_img, comment_content)
+                    comment_avatar_url = f"https://q.qlogo.cn/headimg_dl?dst_uin={comment_uin}&spec=640&img_type=jpg"
+                    comment_html += comment_template.format(
+                        avatar_url=comment_avatar_url,
+                        nickname=comment_nickname,
+                        time=comment_create_time,
+                        message=comment_content
+                    )
+            # 生成每个动态的HTML块
+            post_html += post_template.format(
+                avatar_url=avatar_url,
+                nickname=nickname,
+                time=time,
+                message=message,
+                image=image_html,
+                comments=comment_html
+            )
+        except Exception as err:
+            print(err)
+
+    # 生成完整的HTML
+    final_html = html_template.format(posts=post_html)
+    user_save_path = Config.result_path + Request.uin + '/'
+    # 将HTML写入文件
+    output_file = os.path.join(os.getcwd(), user_save_path, Request.uin + "_说说网页版.html")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(final_html)
+
+
+# 并发下载单个图片
+def download_single_image(args):
+    """下载单个图片的函数"""
+    item_pic_link, item_text, pic_save_path = args
+    
+    if not item_pic_link or len(item_pic_link) == 0 or 'http' not in item_pic_link:
+        return None
+    
+    try:
+        # 去除非法字符 / Emoji表情
+        pic_name = re.sub(r'\[em\].*?\[/em\]|[^\w\s]|[\\/:*?"<>|\r\n]+', '_', item_text).replace(" ", "") + '.jpg'
+        # 去除文件名中的空格
+        pic_name = pic_name.replace(' ', '')
+        # 限制文件名长度
+        if len(pic_name) > 40:
+            pic_name = pic_name[:40] + '.jpg'
+        
+        response = requests.get(item_pic_link, verify=False, timeout=(10, 30))
+        if response.status_code == 200:
+            # 防止图片重名
+            if os.path.exists(pic_save_path + pic_name):
+                pic_name = pic_name.split('.')[0] + "_" + str(int(time.time())) + '.jpg'
+            with open(pic_save_path + pic_name, 'wb') as f:
+                f.write(response.content)
+            return pic_name
+    except Exception as e:
+        print(f"下载图片失败 {item_pic_link}: {e}")
+        return None
+
+# 保存数据
+def save_data():
+    user_save_path = Config.result_path + Request.uin + '/'
+    pic_save_path = user_save_path + 'pic/'
+    if not os.path.exists(user_save_path):
+        os.makedirs(user_save_path)
+        print(f"Created directory: {user_save_path}")
+    if not os.path.exists(pic_save_path):
+        os.makedirs(pic_save_path)
+        print(f"Created directory: {pic_save_path}")
+    pd.DataFrame(texts, columns=['时间', '内容', '图片链接', '评论']).to_excel(
+        user_save_path + Request.uin + '_全部列表.xlsx',
+        index=False)
+    pd.DataFrame(all_friends, columns=['昵称', 'QQ', '空间主页']).to_excel(
+        user_save_path + Request.uin + '_好友列表.xlsx', index=False)
+    
+    # 准备图片下载任务
+    image_download_tasks = []
+    for item in texts:
+        item_text = item[1]
+        # 可见说说中可能存在多张图片
+        item_pic_links = str(item[2]).split(",")
+        for item_pic_link in item_pic_links:
+            if item_pic_link and len(item_pic_link) > 0 and 'http' in item_pic_link:
+                image_download_tasks.append((item_pic_link, item_text, pic_save_path))
+    
+    # 并发下载图片
+    if image_download_tasks:
+        print(f"开始并发下载 {len(image_download_tasks)} 张图片...")
+        with ThreadPoolExecutor(max_workers=5) as executor:  # 限制并发数避免过载
+            for _ in tqdm(executor.map(download_single_image, image_download_tasks), 
+                         total=len(image_download_tasks), 
+                         desc="下载图片", 
+                         unit="张"):
+                pass
+    
+    # 分类处理消息
+    for item in texts:
+        item_text = item[1]
+        if user_nickname in item_text:
+            if '留言' in item_text:
+                leave_message.append(item[:-1])
+            elif '转发' in item_text:
+                forward_message.append(item)
+            else:
+                user_message.append(item)
+        else:
+            other_message.append(item[:-1])
+    pd.DataFrame(user_message, columns=['时间', '内容', '图片链接', '评论']).to_excel(
+        user_save_path + Request.uin + '_说说列表.xlsx', index=False)
+    pd.DataFrame(forward_message, columns=['时间', '内容', '图片链接', '评论']).to_excel(
+        user_save_path + Request.uin + '_转发列表.xlsx', index=False)
+    pd.DataFrame(leave_message, columns=['时间', '内容', '图片链接']).to_excel(
+        user_save_path + Request.uin + '_留言列表.xlsx', index=False)
+    pd.DataFrame(other_message, columns=['时间', '内容', '图片链接']).to_excel(
+        user_save_path + Request.uin + '_其他列表.xlsx', index=False)
+    render_html(user_save_path + Request.uin + '_说说列表.xlsx', user_save_path + Request.uin + '_转发列表.xlsx')
+    Tools.show_author_info()
+    print('\033[36m' + '导出成功，请查看 ' + user_save_path + Request.uin + ' 文件夹内容' + '\033[0m')
+    print('\033[32m' + '共有 ' + str(len(texts)) + ' 条消息' + '\033[0m')
+    print('\033[36m' + '最早的一条说说发布在' + texts[texts.__len__() - 1][0] + '\033[0m')
+    print('\033[32m' + '好友列表共有 ' + str(len(all_friends)) + ' 个好友' + '\033[0m')
+    print('\033[36m' + '说说列表共有 ' + str(len(user_message)) + ' 条说说' + '\033[0m')
+    print('\033[32m' + '转发列表共有 ' + str(len(forward_message)) + ' 条转发' + '\033[0m')
+    print('\033[36m' + '留言列表共有 ' + str(len(leave_message)) + ' 条留言' + '\033[0m')
+    print('\033[32m' + '其他列表共有 ' + str(len(other_message)) + ' 条内容' + '\033[0m')
+    print('\033[36m' + '图片列表共有 ' + str(len(os.listdir(pic_save_path))) + ' 张图片' + '\033[0m')
+    current_directory = os.getcwd()
+    if os.environ.get("QZONE_GUI") != "1":
+        # os.startfile(current_directory + user_save_path[1:])
+        open_file(current_directory + user_save_path[1:])
+        if platform.system() == 'Windows':
+            os.system('pause')
+        else:
+            os.system('stty raw -echo;dd bs=1 count=1 >/dev/null 2>&1;stty cooked echo')
+    else:
+        print(f"导出目录: {os.path.abspath(current_directory + user_save_path[1:])}")
+
+
+# 打开文件展示
+def open_file(file_path):
+    # 检查操作系统
+    if platform.system() == 'Windows':
+        # Windows 系统使用 os.startfile
+        os.startfile(file_path)
+    elif platform.system() == 'Darwin':
+        # macOS 系统使用 subprocess 和 open 命令
+        subprocess.run(['open', file_path])
+    elif platform.system() == 'Linux':
+        # Linux 系统，首先检查是否存在 xdg-open 工具
+        if shutil.which('xdg-open'):
+            subprocess.run(['xdg-open', file_path])
+        # 如果 xdg-open 不存在，检查是否存在 gnome-open 工具（适用于 GNOME 桌面环境）
+        elif shutil.which('gnome-open'):
+            subprocess.run(['gnome-open', file_path])
+        # 如果 gnome-open 不存在，检查是否存在 kde-open 工具（适用于 KDE 桌面环境）
+        elif shutil.which('kde-open'):
+            subprocess.run(['kde-open', file_path])
+        # 如果以上工具都不存在，提示用户手动打开文件
+        else:
+            print("未找到可用的打开命令，请手动打开文件。")
+    else:
+        print(f"Unsupported OS: {platform.system()}")
+
+
+def run_main(return_data=False, fetch_mode="full"):
+    global user_nickname, texts, all_friends, other_message, user_message, leave_message, forward_message
+    texts = []
+    all_friends = []
+    other_message = []
+    user_message = []
+    leave_message = []
+    forward_message = []
+    print("正在验证登录状态...")
+    try:
+        user_info = Request.get_login_user_info()
+        if user_info is None:
+            print("登录失败: 无法获取用户信息")
+            return None
+        user_nickname = user_info[Request.uin][6]
+        print(f"用户<{Request.uin}>,<{user_nickname}>登录成功")
+    except Exception as e:
+        print(f"登录失败:请重新登录,错误信息:{str(e)}")
+        return None
+
+    if fetch_mode != "visible_only":
+        print("=" * 50)
+        print("开始获取历史互动消息（包含已删除动态）...")
+        print("=" * 50)
+        
+        # 使用原始的精确方法获取消息数量
+        print("正在获取消息列表数量（使用二分查找）...")
+        logger.debug("即将调用 Request.get_message_count()...")
+        try:
+            count = Request.get_message_count()
+            logger.debug(f"get_message_count() 返回值: {count}")
+        except Exception as e:
+            logger.debug(f"get_message_count() 异常: {e}")
+            import traceback
+            traceback.print_exc()
+            count = 0
+        print(f"检测到消息列表总数: {count}")
+        if count == 0:
+            print("警告: 消息列表数量为0，可能是API限制或登录问题")
+        try:
+            # 注册信号处理函数 (仅主线程)
+            if threading.current_thread() is threading.main_thread():
+                signal.signal(signal.SIGINT, signal_handler)
+                signal.signal(signal.SIGTERM, signal_handler)
+
+            # 准备批次数据 - 每批获取100条，大幅减少请求次数
+            batch_data_list = []
+            batch_size = 100  # 从10增加到100
+            print(f"正在获取数据（每批{batch_size}条）...")
+            
+            # 先获取所有批次的数据
+            total_batches = int(count / batch_size) + 1
+            for i in trange(total_batches, desc='获取数据批次', unit='批次'):
+                response = Request.get_message(i * batch_size, batch_size)
+                if response is None or not hasattr(response, 'content'):
+                    print(f"获取消息失败：第 {i} 批次，返回值为空或无效")
+                    continue
+                batch_data_list.append((i, response.content))
+                # 大幅减少等待时间
+                time.sleep(0.1)
+            
+            print(f"开始并发处理 {len(batch_data_list)} 个批次的数据...")
+            if len(batch_data_list) == 0:
+                print("警告: 没有获取到任何批次数据，可能是API返回为空")
+            
+            # 使用线程池并发处理
+            max_workers = min(8, len(batch_data_list))  # 限制最大并发数
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交所有任务
+                future_to_batch = {executor.submit(process_batch_messages, batch_data): batch_data 
+                                  for batch_data in batch_data_list}
+                
+                # 处理完成的任务
+                for future in tqdm(as_completed(future_to_batch), 
+                                 total=len(batch_data_list), 
+                                 desc='处理消息批次', 
+                                 unit='批次'):
+                    try:
+                        batch_texts, batch_friends = future.result()
+                        
+                        # 线程安全地合并结果
+                        with texts_lock:
+                            for text_item in batch_texts:
+                                if text_item[1] not in [sublist[1] for sublist in texts]:
+                                    texts.append(text_item)
+                        
+                        with friends_lock:
+                            for friend_item in batch_friends:
+                                if friend_item[1] not in [sublist[1] for sublist in all_friends]:
+                                    all_friends.append(friend_item)
+                                    
+                    except Exception as e:
+                        batch_data = future_to_batch[future]
+                        print(f"处理批次 {batch_data[0]} 时发生异常: {e}")
+
+        except Exception as e:
+            print(f"获取QQ空间互动消息发生异常: {str(e)}")
+
+    texts = normalize_texts(texts)
+    
+    # 记录互动消息数量
+    interaction_count = len(texts)
+    print(f"从互动消息中获取到 {interaction_count} 条记录")
+
+    try:
+        print("开始获取可见说说（强制刷新，不使用缓存）...")
+        # 强制刷新，确保获取所有历史数据
+        user_moments = GetAllMoments.get_visible_moments_list(force_refresh=True)
+        user_moments = normalize_texts(user_moments)
+        if user_moments and len(user_moments) > 0:
+            print(f"获取到 {len(user_moments)} 条可见说说")
+            if fetch_mode == "visible_only":
+                texts = user_moments
+            else:
+                # 简单合并：互动消息 + 可见说说，不做复杂过滤
+                # 直接将可见说说添加到结果中
+                for moment in user_moments:
+                    texts.append(moment)
+                print(f"合并后共 {len(texts)} 条（互动消息 {interaction_count} + 可见说说 {len(user_moments)}）")
+        else:
+            print("未获取到可见说说")
+    except Exception as err:
+        import traceback
+        print(f"获取未删除QQ空间记录发生异常: {str(err)}")
+        traceback.print_exc()
+
+    if len(texts) > 0:
+        texts.sort(key=lambda x: safe_strptime(x[0]) or datetime.min, reverse=True)
+        save_data()
+
+    if return_data:
+        return {
+            "uin": Request.uin,
+            "nickname": user_nickname,
+            "texts": texts,
+            "counts": {
+                "total": len(texts),
+                "friends": len(all_friends),
+                "shuoshuo": len(user_message),
+                "forward": len(forward_message),
+                "leave": len(leave_message),
+                "other": len(other_message),
+            },
+        }
+    return None
+
+
+if __name__ == '__main__':
+    run_main()
