@@ -11,7 +11,7 @@ license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
     {name = "LibraHp"},
-    {name = "Enge1337", email = "contributor"}
+    {name = "Enge1337"}
 ]
 keywords = ["qq", "qzone", "scraper", "history", "social-media"]
 classifiers = [

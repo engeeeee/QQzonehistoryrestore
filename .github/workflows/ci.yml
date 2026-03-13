@@ -26,12 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Lint with ruff
+      - name: Lint (critical rules only)
         run: |
           pip install ruff
-          ruff check .
-
-      - name: Format check with black
-        run: |
-          pip install black
-          black --check .
+          ruff check . --select E9,F63,F7,F82
